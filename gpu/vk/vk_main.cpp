@@ -25,6 +25,7 @@
 #include "vk_reflex.h"
 #include "vk_antilag.h"
 #include "vk_progress.h"
+#include "vk_vr.h"
 
 namespace vkx {
 #define VKX_DEFINE(f) PFN_##f f;
@@ -136,7 +137,9 @@ bool create_instance() {
     // RX_VK_VALIDATION=1: the Khronos validation layer (when installed)
     const char* layer = "VK_LAYER_KHRONOS_validation";
     if (getenv("RX_VK_VALIDATION")) ci.enabledLayerCount = 1, ci.ppEnabledLayerNames = &layer;
-    if (vkCreateInstance(&ci, nullptr, &dev.instance) != VK_SUCCESS) {
+    // (VR) the headset's runtime adds the instance extensions it needs
+    const VkResult made = vr::active() ? vr::create_instance(&ci, &dev.instance) : vkCreateInstance(&ci, nullptr, &dev.instance);
+    if (made != VK_SUCCESS) {
         logf("vk: vkCreateInstance failed");
         return false;
     }
@@ -164,6 +167,20 @@ bool pick_device() {
         }
     }
     menu_set_gpu_count((int)valid_gpus.size());
+    if (vr::active()) {   // (VR) the GPU the headset is attached to, not the menu's choice
+        if (const VkPhysicalDevice pd = vr::physical_device(dev.instance)) {
+            VkPhysicalDeviceProperties vp;
+            vkGetPhysicalDeviceProperties(pd, &vp);
+            if (vp.apiVersion >= VK_API_VERSION_1_3) {
+                logf("vr: using the headset's GPU: %s", vp.deviceName);
+                dev.physical = pd;
+                dev.props = vp;
+                vkGetPhysicalDeviceMemoryProperties(dev.physical, &dev.memory);
+                return true;
+            }
+            logf("vr: the headset's GPU (%s) lacks Vulkan 1.3: VR cannot work on it", vp.deviceName);
+        }
+    }
 
     // (AMD laptops) With AMD graphics in the processor and an AMD card, Windows has two AMD drivers installed, one an
     // adapter, and each one's Vulkan driver lists every AMD GPU: the card shows up twice. It came first through the
@@ -449,7 +466,8 @@ bool create_device() {
     ci.pQueueCreateInfos = qs;
     ci.enabledExtensionCount = (uint32_t)want.size();
     ci.ppEnabledExtensionNames = want.data();
-    if (vkCreateDevice(dev.physical, &ci, nullptr, &dev.device) != VK_SUCCESS) {
+    const VkResult dmade = vr::active() ? vr::create_device(dev.physical, &ci, &dev.device) : vkCreateDevice(dev.physical, &ci, nullptr, &dev.device);
+    if (dmade != VK_SUCCESS) {
         logf("vk: vkCreateDevice failed");
         return false;
     }
@@ -1040,7 +1058,16 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
         logf("vk: vulkan-1.dll not found");
         return nullptr;
     }
+    logf("vr: build %s; HOOKSHOT_VR=%s",
+#ifdef HOOKSHOT_VR_BUILD
+         "has VR",
+#else
+         "has NO VR",
+#endif
+         getenv("HOOKSHOT_VR") ? getenv("HOOKSHOT_VR") : "(not set)");
+    if (vr::wanted() && !vr::init()) logf("vr: HOOKSHOT_VR is set but VR could not start: the game runs on the desktop only");
     if (!create_instance() || !pick_device() || !create_device()) return nullptr;
+    if (vr::active() && !vr::create_session()) logf("vr: the OpenXR session could not be made: the game runs on the desktop only");
     logf("vk: %s, Vulkan %u.%u, driver %#x; mesh shaders %s, host memory import %s, pipeline libraries %s",
          dev.props.deviceName, VK_VERSION_MAJOR(dev.props.apiVersion), VK_VERSION_MINOR(dev.props.apiVersion),
          dev.props.driverVersion, dev.mesh_shader ? "yes" : "no", dev.external_memory_host ? "yes" : "no",

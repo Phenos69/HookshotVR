@@ -44,6 +44,7 @@
 #include "vk_jobs.h"
 #include "vk_shader.h"
 #include "vk_texture.h"
+#include "vk_vr.h"
 #include "movie_upscale_policy.h"
 #include "skip_code.h"
 
@@ -390,6 +391,8 @@ struct RecordingRes {
     uint64_t before = 0;           // (what the recording used of the streams before this one)
     uint32_t idle = 0;             // (recordings of the slot that stayed in the first stream)
     std::unordered_map<const void*, std::pair<VkBuffer, uint64_t>> c1_at;   // (c1 of a stage: uploaded once a recording)
+    struct VrUb { uint64_t gen; VkBuffer buf; uint64_t at; };
+    std::unordered_map<uint64_t, VrUb> vr_ub;   // (VR stereo: a uniform range with the eye's camera in it: its copy in the stream, or none)
 };
 // (a recording's first stream: one for each of the kRecordings slots. RX_VK_STREAM_MB=<n>: that size, 2 by default; a recording
 // that needs more is given a bigger stream for the rest of it (RX_VK_STREAM_GROW_OFF=1: draws are skipped instead, and the default
@@ -2465,6 +2468,41 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
         const uint64_t want = used ? std::max<uint64_t>(used, 16) : std::max<uint64_t>(u.size, 16);
         const uint64_t n = std::min<uint64_t>(std::min<uint64_t>(want, u.size ? std::max<uint64_t>(u.size, 16) : want),
                                               dev.props.limits.maxUniformBufferRange);
+        // (VR stereo) the game's camera in this range: looked for (mode 1), or changed to the eye's, in a copy in the stream (mode 2)
+        if (const int vm = vr::stereo_mode()) {
+            auto& cache = cur->vr_ub;
+            const uint64_t key = u.addr * 1000003ull + n;
+            const uint64_t gen = ub_generation();
+            bool known = false;
+            if (vm == 2) {
+                const auto it = cache.find(key);
+                if (it != cache.end() && it->second.gen == gen && it->second.buf == cur->stream) {
+                    known = true;
+                    if (it->second.at != UINT64_MAX) return {cur->stream, it->second.at, n};
+                }
+            }
+            if (!known && stream_reserve(n, align)) {
+                // the range as the normal path below would give it (the stream's updates in flight laid over it, else the
+                // contents as the submission had them, not as the game has rewritten them since), then the camera changed in it
+                static thread_local std::vector<uint8_t> vtmp;
+                vtmp.resize(n);
+                const uint64_t ov = ub_overlay(u.addr, n, cur->mapped, [&](uint64_t bytes) { return stream_alloc(bytes, align); });
+                if (ov != UINT64_MAX) std::memcpy(vtmp.data(), cur->mapped + ov, n);
+                const bool have = ov != UINT64_MAX || memory_read_as_submitted(u.addr, vtmp.data(), n);
+                const int changed = have ? vr::patch_uniform(vtmp.data(), n, u.addr) : 0;
+                if (vm == 1) {
+                    if (ov != UINT64_MAX) return {cur->stream, ov, n};
+                } else {
+                    uint64_t at = ov;
+                    if (changed) {
+                        if (at == UINT64_MAX) at = stream_alloc(n, align);
+                        if (at != UINT64_MAX) std::memcpy(cur->mapped + at, vtmp.data(), n);
+                    }
+                    cache[key] = {gen, cur->stream, at};
+                    if (at != UINT64_MAX) return {cur->stream, at, n};
+                }
+            }
+        }
         // (updates the stream made to this range in this submission or ones still in flight: a copy with them in)
         // (room first: the overlay copies into the stream's mapping, which a move to a bigger stream in the middle would change)
         if (stream_reserve(n, align))
@@ -4266,6 +4304,7 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
              (unsigned long long)stream_grown.load(), (unsigned long long)(stream_extra.load() >> 20));
     r.used = 0, r.before = 0;
     r.c1_at.clear();
+    r.vr_ub.clear();
     cur = &r;
     pass() = Pass{};
     work_since_barrier = false;

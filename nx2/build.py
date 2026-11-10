@@ -105,6 +105,18 @@ def check_vk_symbols(so):
     print("  namespace scope, not inside an anonymous namespace")
     return False
 
+def openxr_flags():
+    """(hookshot VR) OPENXR_ROOT=<folder with include/openxr/openxr.h>: builds the VR cinema mode into hookshot_vk.dll
+    (gpu/vk/vk_vr.cpp). The loader itself, openxr_loader.dll, is loaded at run time: nothing is linked. The define is in the
+    object keys, which leave the include folders out, so switching it rebuilds the back end."""
+    root = os.environ.get("OPENXR_ROOT", "")
+    if root and os.path.isfile(os.path.join(root, "include", "openxr", "openxr.h")):
+        return ["-DHOOKSHOT_VR_BUILD=1", "-I" + os.path.join(root, "include")]
+    if root:
+        print("OPENXR_ROOT=%s has no include/openxr/openxr.h: built without VR" % root)
+    return []
+
+
 def target():
     """toolchain.native_target(), with the sysroot on Linux"""
     return toolchain.native_target() + (["--sysroot=" + SYSROOT] if LINUX and SYSROOT else [])
@@ -901,7 +913,7 @@ def main():
             "-I" + os.path.join(vk, "sirit", "include"), "-I" + os.path.join(vk, "sirit", "src"),
             "-I" + os.path.join(spirv_headers, "include"), "-I" + os.path.join(spirv_headers, "include", "spirv", "unified1"),
             "-I" + os.path.join(vk_headers, "include"), "-I" + os.path.join(vma_headers, "include"),
-            "-I" + vk, "-I" + gen_dir]
+            "-I" + vk, "-I" + gen_dir] + openxr_flags()
         # (NVIDIA DLSS, a local build's option: scripts/ngx_sdk.py. Only vk_dlss.cpp sees NVIDIA's headers; without them
         # it is the stubs that say DLSS is not there)
         ngx_flags = ["-DHOOKSHOT_NGX", "-I" + os.path.join(NGX_SDK, "include")] if NGX_SDK else []

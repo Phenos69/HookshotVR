@@ -38,6 +38,7 @@
 #include "vk_dump.h"
 #include "vk_paths.h"   // (game_module_path: the frame trace beside the game)
 #include "vk_gprof.h"
+#include "vk_vr.h"
 #include "vk_framegen.h"
 #include "vk_menu.h"
 #include "vk_jobs.h"
@@ -1569,6 +1570,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
 std::vector<std::vector<uint64_t>> frame_submits;   // (this frame's submits' handles)
 uint64_t frame_first_value = 0;
 std::atomic<uint64_t> replayed_hold{0};             // (0: none)
+bool stereo_held = false;                          // (VR stereo: replayed_hold is set for the frame's eyes)
 
 void bench_replay(const std::vector<uint64_t>& handles) {
     const uint64_t value = pushed.load();   // (reached already: no slot waits on it)
@@ -1887,9 +1889,15 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
     SlowWatch slow("submit");
     PROF(PROF_SUBMIT);
     if (memory_work) {
-        if (frame_submits.empty()) frame_first_value = value;
+        const bool first_submit = frame_submits.empty();
+        if (first_submit) {
+            frame_first_value = value;
+            vr::stereo_frame_start();   // (VR stereo: the camera is looked for in this frame; its recordings are kept for the eyes)
+            if (vr::stereo_active()) stereo_held = true;
+        }
         frame_submits.emplace_back(handles, handles + std::max(n, 0));
         submit_memory_work(value);
+        if (first_submit) vr::stereo_prepass();
     }
     if (burst_open && rec_cur) {   // (the burst's recording goes on: what the piece before did, done first)
         end_pass(rec_cur->cmd);
@@ -2064,9 +2072,15 @@ void submit_job(std::vector<uint64_t>& handles, uint64_t value, uint64_t queue) 
     auto it = qruns.find(queue);
     if (it != qruns.end() && it->second.blocked()) {   // (its memory work now, in the order of the submits)
         std::lock_guard lk(replay_mu);
-        if (frame_submits.empty()) frame_first_value = value;
+        const bool first_submit = frame_submits.empty();
+        if (first_submit) {
+            frame_first_value = value;
+            vr::stereo_frame_start();
+            if (vr::stereo_active()) stereo_held = true;
+        }
         frame_submits.emplace_back(handles);
         submit_memory_work(value);
+        if (first_submit) vr::stereo_prepass();
         it->second.later.push_back({std::move(handles), value});
         return;
     }
@@ -2922,8 +2936,15 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         std::lock_guard lk(replay_mu);
         bench_frame(presents);
         SlowWatch slow("present");
+        const bool stereo_frame = stereo_held;
         frame_submits.clear();
         PROF(PROF_PRESENT);
+        if (stereo_frame) {
+            stereo_held = false;
+            if (t && !dev.offscreen)
+                if (Texture* vt = texture_for_present(t); vt && vt->gpu_written) vr::stereo_present(vt->image, vt->width, vt->height, crop);
+            vr::stereo_frame_done();
+        }
         const uint64_t value = present_value ? present_value : ++q_values;
         present_value = 0;
         rec_value_now = value;
@@ -3457,6 +3478,8 @@ static void present_out(uint32_t index, std::unique_lock<std::mutex>& qk);   // 
 thread_local PendingPresent* present_defer_into = nullptr;
 void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view) {
     std::lock_guard lk(present_image_mu);
+    vr::probe_tick();
+    if (src) vr::present(src, sw, sh, crop);
     static int hdr_was = -1;   // (the Insert menu's HDR as the swapchain was made for it; -1: not yet looked at)
     const bool hdr_changed = hdr_was >= 0 && hdr_was != opts.hdr;   // (turned on or off: the swapchain's format)
     if (hdr_was < 0) hdr_was = opts.hdr;
